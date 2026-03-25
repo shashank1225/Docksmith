@@ -3,8 +3,9 @@ package cmd
 import (
 	"errors"
 	"flag"
-	"fmt"
 	"io"
+
+	"docksmith/engine"
 )
 
 func HandleBuild(args []string) error {
@@ -27,13 +28,9 @@ func HandleBuild(args []string) error {
 		return errors.New("build requires exactly one context path")
 	}
 
-	Build(tag, remaining[0])
-	return nil
+	return Build(tag, remaining[0])
 }
 
-func Build(tag string, context string) {
-	fmt.Println("Step 1/3 : FROM base")
-	fmt.Println("Step 2/3 : COPY . /app")
-	fmt.Println("Step 3/3 : RUN build")
-	fmt.Printf("BUILD called with tag=%s, context=%s\n", tag, context)
+func Build(tag string, context string) error {
+	return engine.Build(tag, context)
 }
