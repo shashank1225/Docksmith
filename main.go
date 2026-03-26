@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"docksmith/cmd"
+	dockruntime "docksmith/runtime"
 )
 
 func main() {
@@ -43,6 +44,11 @@ func main() {
 		}
 	case "help", "--help", "-h":
 		printUsage()
+	case "__docksmith_internal_exec":
+		if err := dockruntime.ExecuteInternal(); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unknown command %q\n", command)
 		printUsage()
@@ -55,7 +61,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Usage:")
 	fmt.Println("  docksmith build -t <name:tag> <context>")
-	fmt.Println("  docksmith run <name:tag>")
+	fmt.Println("  docksmith run [-e KEY=value ...] <name:tag>")
 	fmt.Println("  docksmith images")
 	fmt.Println("  docksmith rmi <name:tag>")
 	fmt.Println()
@@ -67,7 +73,7 @@ func printBuildUsage() {
 }
 
 func printRunUsage() {
-	fmt.Println("Usage: docksmith run <name:tag>")
+	fmt.Println("Usage: docksmith run [-e KEY=value ...] <name:tag>")
 }
 
 func printImagesUsage() {
