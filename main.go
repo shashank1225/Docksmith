@@ -60,8 +60,8 @@ func printUsage() {
 	fmt.Println("docksmith - a lightweight container CLI")
 	fmt.Println()
 	fmt.Println("Usage:")
-	fmt.Println("  docksmith build -t <name:tag> <context>")
-	fmt.Println("  docksmith run [-e KEY=value ...] <name:tag>")
+	fmt.Println("  docksmith build -t <name:tag> [--no-cache] <context>")
+	fmt.Println("  docksmith run [-e KEY=value ...] <name:tag> [cmd ...]")
 	fmt.Println("  docksmith images")
 	fmt.Println("  docksmith rmi <name:tag>")
 	fmt.Println()
@@ -69,11 +69,11 @@ func printUsage() {
 }
 
 func printBuildUsage() {
-	fmt.Println("Usage: docksmith build -t <name:tag> <context>")
+	fmt.Println("Usage: docksmith build -t <name:tag> [--no-cache] <context>")
 }
 
 func printRunUsage() {
-	fmt.Println("Usage: docksmith run [-e KEY=value ...] <name:tag>")
+	fmt.Println("Usage: docksmith run [-e KEY=value ...] <name:tag> [cmd ...]")
 }
 
 func printImagesUsage() {

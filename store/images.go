@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,23 +18,33 @@ type ImageConfig struct {
 	Env        map[string]string `json:"Env"`
 	Cmd        []string          `json:"Cmd"`
 	WorkingDir string            `json:"WorkingDir"`
-	BaseImage  string            `json:"BaseImage"`
+}
+
+type LayerDescriptor struct {
+	Digest    string `json:"digest"`
+	Size      int64  `json:"size"`
+	CreatedBy string `json:"createdBy"`
 }
 
 type ImageManifest struct {
-	Name      string      `json:"name"`
-	Tag       string      `json:"tag"`
-	Layers    []string    `json:"layers"`
-	Config    ImageConfig `json:"config"`
-	CreatedAt string      `json:"createdAt"`
+	Name    string            `json:"name"`
+	Tag     string            `json:"tag"`
+	Digest  string            `json:"digest"`
+	Created string            `json:"created"`
+	Config  ImageConfig       `json:"config"`
+	Layers  []LayerDescriptor `json:"layers"`
 }
 
 func SaveImage(manifest ImageManifest) error {
 	if strings.TrimSpace(manifest.Name) == "" || strings.TrimSpace(manifest.Tag) == "" {
 		return fmt.Errorf("image manifest must include name and tag")
 	}
-	if manifest.CreatedAt == "" {
-		manifest.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+
+	if manifest.Config.Env == nil {
+		manifest.Config.Env = map[string]string{}
+	}
+	if manifest.Config.WorkingDir == "" {
+		manifest.Config.WorkingDir = "/"
 	}
 
 	if err := cache.EnsureLayout(); err != nil {
@@ -44,19 +56,51 @@ func SaveImage(manifest ImageManifest) error {
 		return err
 	}
 
+	if existing, err := LoadImage(manifest.Name + ":" + manifest.Tag); err == nil {
+		manifest.Created = existing.Created
+	}
+	if manifest.Created == "" {
+		manifest.Created = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	digest, err := ComputeManifestDigest(manifest)
+	if err != nil {
+		return err
+	}
+	manifest.Digest = digest
+
+	payload, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode image manifest %q: %w", path, err)
+	}
+
 	file, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("create image manifest %q: %w", path, err)
 	}
 	defer file.Close()
 
-	enc := json.NewEncoder(file)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(manifest); err != nil {
+	if _, err := file.Write(payload); err != nil {
+		return fmt.Errorf("write image manifest %q: %w", path, err)
+	}
+	if _, err := file.Write([]byte("\n")); err != nil {
 		return fmt.Errorf("write image manifest %q: %w", path, err)
 	}
 
 	return nil
+}
+
+func ComputeManifestDigest(manifest ImageManifest) (string, error) {
+	canonical := manifest
+	canonical.Digest = ""
+
+	payload, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("encode canonical manifest: %w", err)
+	}
+
+	sum := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 func LoadImage(imageRef string) (*ImageManifest, error) {
@@ -83,6 +127,9 @@ func LoadImage(imageRef string) (*ImageManifest, error) {
 
 	if manifest.Config.Env == nil {
 		manifest.Config.Env = map[string]string{}
+	}
+	if manifest.Config.WorkingDir == "" {
+		manifest.Config.WorkingDir = "/"
 	}
 
 	return &manifest, nil
@@ -158,25 +205,9 @@ func DeleteImage(imageRef string) ([]string, error) {
 		return nil, fmt.Errorf("remove image manifest %q: %w", path, err)
 	}
 
-	all, err := ListImages()
-	if err != nil {
-		return nil, err
-	}
-
-	inUse := make(map[string]bool)
-	for _, img := range all {
-		for _, digest := range img.Layers {
-			inUse[digest] = true
-		}
-	}
-
 	removed := make([]string, 0)
-	for _, digest := range target.Layers {
-		if inUse[digest] {
-			continue
-		}
-
-		layerPath, err := cache.LayerPath(digest)
+	for _, layer := range target.Layers {
+		layerPath, err := cache.LayerPath(layer.Digest)
 		if err != nil {
 			return nil, err
 		}
@@ -186,7 +217,7 @@ func DeleteImage(imageRef string) ([]string, error) {
 			return nil, fmt.Errorf("remove layer archive %q: %w", layerPath, err)
 		}
 
-		removed = append(removed, digest)
+		removed = append(removed, layer.Digest)
 	}
 
 	return removed, nil

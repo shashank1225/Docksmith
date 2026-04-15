@@ -1,0 +1,16 @@
+FROM alpine:3.18
+
+# Define an environment variable (Can be overriden at runtime using `docksmith run -e`)
+ENV GREETING=Hello
+
+# Set the working directory
+WORKDIR /app
+
+# Copy the sample script (deltas only exactly as copied)
+COPY script.sh .
+
+# Modifies the filesystem by changing execution permissions (tests delta layer cache!)
+RUN chmod +x script.sh
+
+# Defines the default command to run
+CMD ["/app/script.sh"]

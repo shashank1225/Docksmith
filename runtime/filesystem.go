@@ -28,10 +28,10 @@ func PrepareContainerFilesystem(imageRef string) (string, string, *store.ImageMa
 		return "", "", nil, err
 	}
 
-	for _, digest := range manifest.Layers {
-		if err := layers.ExtractLayer(digest, rootFS); err != nil {
+	for _, layer := range manifest.Layers {
+		if err := layers.ExtractLayer(layer.Digest, rootFS); err != nil {
 			_ = os.RemoveAll(bundleDir)
-			return "", "", nil, fmt.Errorf("extract layer %q: %w", digest, err)
+			return "", "", nil, fmt.Errorf("extract layer %q: %w", layer.Digest, err)
 		}
 	}
 

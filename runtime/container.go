@@ -14,6 +14,7 @@ import (
 // RunOptions specifies options for running a container
 type RunOptions struct {
 	EnvOverrides map[string]string
+	Command      []string
 }
 
 // RunContainer runs a container from an image
@@ -32,7 +33,12 @@ func RunContainer(image string, opts RunOptions) error {
 		env[k] = v
 	}
 
-	if len(manifest.Config.Cmd) == 0 {
+	command := manifest.Config.Cmd
+	if len(opts.Command) > 0 {
+		command = opts.Command
+	}
+
+	if len(command) == 0 {
 		return fmt.Errorf("image %q has no configured command", image)
 	}
 	if manifest.Config.WorkingDir == "" {
@@ -40,14 +46,24 @@ func RunContainer(image string, opts RunOptions) error {
 	}
 
 	if runtime.GOOS != "linux" {
-		return executeWithoutIsolation(rootFS, manifest.Config.WorkingDir, manifest.Config.Cmd, env)
+		return executeWithoutIsolation(rootFS, manifest.Config.WorkingDir, command, env)
 	}
 
-	if err := executeInContainer(rootFS, manifest.Config.WorkingDir, manifest.Config.Cmd, env); err != nil {
+	if err := executeInContainer(rootFS, manifest.Config.WorkingDir, command, env); err != nil {
 		return fmt.Errorf("run image %q: %w", image, err)
 	}
 
 	return nil
+}
+
+func ExecuteShellInRootFS(rootFS string, workingDir string, env map[string]string, command string) error {
+	cmdParts := []string{"/bin/sh", "-c", command}
+
+	if runtime.GOOS != "linux" {
+		return executeWithoutIsolation(rootFS, workingDir, cmdParts, env)
+	}
+
+	return executeInContainer(rootFS, workingDir, cmdParts, env)
 }
 
 // ExecuteInternal is called for internal container execution

@@ -3,21 +3,27 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"docksmith/cache"
 	"docksmith/layers"
+	dockruntime "docksmith/runtime"
 	"docksmith/store"
 )
 
-// Build builds a container image from a Dockerfile in the context directory
-func Build(tag string, context string) error {
+type BuildOptions struct {
+	NoCache bool
+}
+
+func Build(tag string, context string, opts BuildOptions) error {
 	name, imageTag, err := store.ParseImageReference(tag)
 	if err != nil {
 		return err
@@ -36,6 +42,18 @@ func Build(tag string, context string) error {
 	if err != nil {
 		return err
 	}
+	if len(spec.Instructions) == 0 || spec.Instructions[0].Op != "FROM" {
+		return fmt.Errorf("line %d: first instruction must be FROM", spec.Instructions[0].Line)
+	}
+
+	cacheIndex := map[string]string{}
+	if !opts.NoCache {
+		cacheIndex, err = cache.LoadCacheIndex()
+		if err != nil {
+			return err
+		}
+	}
+	cacheDirty := false
 
 	rootFS, err := os.MkdirTemp("", "docksmith-build-rootfs-")
 	if err != nil {
@@ -48,19 +66,47 @@ func Build(tag string, context string) error {
 		WorkingDir: "/",
 	}
 
-	layerDigests := make([]string, 0)
-	prevDigest := "base:empty"
+	manifestLayers := make([]store.LayerDescriptor, 0)
+	prevDigest := ""
+	pendingWorkdirCreate := false
+	cascadeMiss := false
 
 	for idx, inst := range spec.Instructions {
 		fmt.Printf("Step %d/%d : %s\n", idx+1, len(spec.Instructions), inst.Raw)
 
 		switch inst.Op {
 		case "FROM":
-			imageConfig.BaseImage = strings.TrimSpace(inst.Args[0])
+			baseRef := normalizeImageRef(inst.Args[0])
+			baseManifest, err := store.LoadImage(baseRef)
+			if err != nil {
+				return fmt.Errorf("line %d: FROM %q failed: %w", inst.Line, baseRef, err)
+			}
+
 			if err := resetDir(rootFS); err != nil {
 				return err
 			}
-			prevDigest = cache.HashParts("FROM", imageConfig.BaseImage)
+			for _, layer := range baseManifest.Layers {
+				if err := layers.ExtractLayer(layer.Digest, rootFS); err != nil {
+					return fmt.Errorf("extract base layer %q: %w", layer.Digest, err)
+				}
+			}
+
+			manifestLayers = append([]store.LayerDescriptor{}, baseManifest.Layers...)
+			prevDigest = baseManifest.Digest
+			if prevDigest == "" {
+				prevDigest = "base:empty"
+			}
+			imageConfig.WorkingDir = baseManifest.Config.WorkingDir
+			if imageConfig.WorkingDir == "" {
+				imageConfig.WorkingDir = "/"
+			}
+			for k, v := range baseManifest.Config.Env {
+				imageConfig.Env[k] = v
+			}
+			if len(baseManifest.Config.Cmd) > 0 {
+				imageConfig.Cmd = append([]string{}, baseManifest.Config.Cmd...)
+			}
+			cascadeMiss = false
 		case "ENV":
 			key, value, err := parseEnvPair(inst.Args[0])
 			if err != nil {
@@ -69,96 +115,210 @@ func Build(tag string, context string) error {
 			imageConfig.Env[key] = value
 		case "WORKDIR":
 			imageConfig.WorkingDir = normalizeContainerPath(imageConfig.WorkingDir, inst.Args[0])
-			if err := os.MkdirAll(filepath.Join(rootFS, trimLeadingSlash(imageConfig.WorkingDir)), 0o755); err != nil {
-				return fmt.Errorf("create workdir %q: %w", imageConfig.WorkingDir, err)
-			}
+			pendingWorkdirCreate = true
 		case "CMD":
-			imageConfig.Cmd = []string{"/bin/sh", "-c", inst.Args[0]}
+			cmd, err := parseCmdJSON(inst.Args[0])
+			if err != nil {
+				return fmt.Errorf("line %d: %w", inst.Line, err)
+			}
+			imageConfig.Cmd = cmd
 		case "COPY":
-			src := inst.Args[0]
-			dst := inst.Args[1]
+			if prevDigest == "" {
+				return fmt.Errorf("line %d: FROM must appear before COPY", inst.Line)
+			}
+			if pendingWorkdirCreate {
+				if err := ensureWorkDirExists(rootFS, imageConfig.WorkingDir); err != nil {
+					return err
+				}
+				pendingWorkdirCreate = false
+			}
 
-			sourceHash, err := hashContextPath(absContext, src)
+			sources, err := expandCopySources(absContext, inst.Args[0])
+			if err != nil {
+				return fmt.Errorf("line %d: %w", inst.Line, err)
+			}
+
+			sourceHash, err := hashCopySources(absContext, sources)
 			if err != nil {
 				return err
 			}
 
-			digest := cache.HashParts(prevDigest, "COPY", src, dst, sourceHash)
-			hit, err := layers.LayerExists(digest)
+			cacheKey := cache.HashParts(
+				prevDigest,
+				inst.Raw,
+				imageConfig.WorkingDir,
+				serializeEnv(imageConfig.Env),
+				sourceHash,
+			)
+
+			resolvedDst := normalizeContainerPath(imageConfig.WorkingDir, inst.Args[1])
+			if strings.HasSuffix(inst.Args[1], "/") || inst.Args[1] == "." || inst.Args[1] == "./" {
+				if !strings.HasSuffix(resolvedDst, "/") {
+					resolvedDst += "/"
+				}
+			}
+
+			stepStart := time.Now()
+			digest, size, hit, err := runCopyStep(absContext, rootFS, sources, resolvedDst, inst.Raw, cacheKey, cacheIndex, opts.NoCache, cascadeMiss)
 			if err != nil {
 				return err
 			}
 
 			if hit {
-				fmt.Printf("[CACHE HIT] COPY %s %s\n", src, dst)
-				if err := resetDir(rootFS); err != nil {
-					return err
-				}
-				if err := layers.ExtractLayer(digest, rootFS); err != nil {
-					return err
-				}
+				fmt.Printf("[CACHE HIT] %.2fs\n", time.Since(stepStart).Seconds())
 			} else {
-				fmt.Printf("[CACHE MISS] COPY %s %s\n", src, dst)
-				if err := copyFromContext(absContext, src, rootFS, dst); err != nil {
-					return err
-				}
-				if err := layers.WriteSnapshotLayer(digest, rootFS); err != nil {
-					return err
+				fmt.Printf("[CACHE MISS] %.2fs\n", time.Since(stepStart).Seconds())
+				cascadeMiss = true
+				if !opts.NoCache {
+					cacheIndex[cacheKey] = digest
+					cacheDirty = true
 				}
 			}
 
-			layerDigests = append(layerDigests, digest)
+			manifestLayers = append(manifestLayers, store.LayerDescriptor{Digest: digest, Size: size, CreatedBy: inst.Raw})
 			prevDigest = digest
 		case "RUN":
-			envHash := hashEnv(imageConfig.Env)
-			digest := cache.HashParts(prevDigest, "RUN", inst.Args[0], imageConfig.WorkingDir, envHash)
-			hit, err := layers.LayerExists(digest)
+			if prevDigest == "" {
+				return fmt.Errorf("line %d: FROM must appear before RUN", inst.Line)
+			}
+			if pendingWorkdirCreate {
+				if err := ensureWorkDirExists(rootFS, imageConfig.WorkingDir); err != nil {
+					return err
+				}
+				pendingWorkdirCreate = false
+			}
+
+			cacheKey := cache.HashParts(
+				prevDigest,
+				inst.Raw,
+				imageConfig.WorkingDir,
+				serializeEnv(imageConfig.Env),
+			)
+
+			stepStart := time.Now()
+			digest, size, hit, err := runCommandStep(rootFS, imageConfig.WorkingDir, imageConfig.Env, inst.Args[0], inst.Raw, cacheKey, cacheIndex, opts.NoCache, cascadeMiss)
 			if err != nil {
 				return err
 			}
 
 			if hit {
-				fmt.Printf("[CACHE HIT] RUN %s\n", inst.Args[0])
-				if err := resetDir(rootFS); err != nil {
-					return err
-				}
-				if err := layers.ExtractLayer(digest, rootFS); err != nil {
-					return err
-				}
+				fmt.Printf("[CACHE HIT] %.2fs\n", time.Since(stepStart).Seconds())
 			} else {
-				fmt.Printf("[CACHE MISS] RUN %s\n", inst.Args[0])
-				if err := runInRootFS(rootFS, imageConfig.WorkingDir, imageConfig.Env, inst.Args[0]); err != nil {
-					return err
-				}
-				if err := layers.WriteSnapshotLayer(digest, rootFS); err != nil {
-					return err
+				fmt.Printf("[CACHE MISS] %.2fs\n", time.Since(stepStart).Seconds())
+				cascadeMiss = true
+				if !opts.NoCache {
+					cacheIndex[cacheKey] = digest
+					cacheDirty = true
 				}
 			}
 
-			layerDigests = append(layerDigests, digest)
+			manifestLayers = append(manifestLayers, store.LayerDescriptor{Digest: digest, Size: size, CreatedBy: inst.Raw})
 			prevDigest = digest
 		default:
-			return fmt.Errorf("unsupported instruction %q", inst.Op)
+			return fmt.Errorf("line %d: unsupported instruction %q", inst.Line, inst.Op)
 		}
-	}
-
-	if len(imageConfig.Cmd) == 0 {
-		imageConfig.Cmd = []string{"/bin/sh"}
 	}
 
 	manifest := store.ImageManifest{
 		Name:   name,
 		Tag:    imageTag,
-		Layers: layerDigests,
 		Config: imageConfig,
+		Layers: manifestLayers,
 	}
 
 	if err := store.SaveImage(manifest); err != nil {
 		return err
 	}
 
-	fmt.Printf("Successfully built %s\n", tag)
+	if cacheDirty && !opts.NoCache {
+		if err := cache.SaveCacheIndex(cacheIndex); err != nil {
+			return err
+		}
+	}
+
+	saved, err := store.LoadImage(name + ":" + imageTag)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Successfully built %s %s\n", saved.Digest, name+":"+imageTag)
 	return nil
+}
+
+func runCopyStep(contextDir string, rootFS string, sources []string, dst string, createdBy string, cacheKey string, cacheIndex map[string]string, noCache bool, cascadeMiss bool) (string, int64, bool, error) {
+	if !noCache && !cascadeMiss {
+		if digest, ok := cacheIndex[cacheKey]; ok {
+			exists, err := layers.LayerExists(digest)
+			if err != nil {
+				return "", 0, false, err
+			}
+			if exists {
+				if err := layers.ExtractLayer(digest, rootFS); err != nil {
+					return "", 0, false, err
+				}
+				size, err := layers.GetLayerSize(digest)
+				if err != nil {
+					return "", 0, false, err
+				}
+				return digest, size, true, nil
+			}
+		}
+	}
+
+	preStateDir, err := snapshotDirectory(rootFS)
+	if err != nil {
+		return "", 0, false, err
+	}
+	defer os.RemoveAll(preStateDir)
+
+	if err := copyFromContext(contextDir, sources, rootFS, dst); err != nil {
+		return "", 0, false, err
+	}
+
+	digest, size, err := layers.WriteDeltaLayer(preStateDir, rootFS)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("write layer for %q: %w", createdBy, err)
+	}
+
+	return digest, size, false, nil
+}
+
+func runCommandStep(rootFS string, workDir string, env map[string]string, command string, createdBy string, cacheKey string, cacheIndex map[string]string, noCache bool, cascadeMiss bool) (string, int64, bool, error) {
+	if !noCache && !cascadeMiss {
+		if digest, ok := cacheIndex[cacheKey]; ok {
+			exists, err := layers.LayerExists(digest)
+			if err != nil {
+				return "", 0, false, err
+			}
+			if exists {
+				if err := layers.ExtractLayer(digest, rootFS); err != nil {
+					return "", 0, false, err
+				}
+				size, err := layers.GetLayerSize(digest)
+				if err != nil {
+					return "", 0, false, err
+				}
+				return digest, size, true, nil
+			}
+		}
+	}
+
+	preStateDir, err := snapshotDirectory(rootFS)
+	if err != nil {
+		return "", 0, false, err
+	}
+	defer os.RemoveAll(preStateDir)
+
+	if err := dockruntime.ExecuteShellInRootFS(rootFS, workDir, env, command); err != nil {
+		return "", 0, false, fmt.Errorf("RUN command %q failed: %w", command, err)
+	}
+
+	digest, size, err := layers.WriteDeltaLayer(preStateDir, rootFS)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("write layer for %q: %w", createdBy, err)
+	}
+
+	return digest, size, false, nil
 }
 
 func parseEnvPair(raw string) (string, string, error) {
@@ -173,6 +333,22 @@ func parseEnvPair(raw string) (string, string, error) {
 	}
 
 	return key, parts[1], nil
+}
+
+func parseCmdJSON(raw string) ([]string, error) {
+	var cmd []string
+	if err := json.Unmarshal([]byte(raw), &cmd); err != nil {
+		return nil, fmt.Errorf("CMD must be JSON array form, got %q", raw)
+	}
+	if len(cmd) == 0 {
+		return nil, fmt.Errorf("CMD cannot be empty")
+	}
+	for _, part := range cmd {
+		if strings.TrimSpace(part) == "" {
+			return nil, fmt.Errorf("CMD arguments must not be empty strings")
+		}
+	}
+	return cmd, nil
 }
 
 func normalizeContainerPath(current string, next string) string {
@@ -198,23 +374,47 @@ func resetDir(path string) error {
 	return nil
 }
 
-func copyFromContext(contextDir string, src string, rootFS string, dst string) error {
-	sourcePath := filepath.Join(contextDir, filepath.FromSlash(src))
-	info, err := os.Stat(sourcePath)
-	if err != nil {
-		return fmt.Errorf("stat COPY source %q: %w", sourcePath, err)
+func ensureWorkDirExists(rootFS string, workDir string) error {
+	hostWorkDir := filepath.Join(rootFS, trimLeadingSlash(workDir))
+	if err := os.MkdirAll(hostWorkDir, 0o755); err != nil {
+		return fmt.Errorf("create WORKDIR %q: %w", workDir, err)
 	}
+	return nil
+}
 
+func copyFromContext(contextDir string, sources []string, rootFS string, dst string) error {
 	destPath := filepath.Join(rootFS, filepath.FromSlash(trimLeadingSlash(dst)))
-	if info.IsDir() {
-		return copyDirectory(sourcePath, destPath)
+	destIsDir := strings.HasSuffix(dst, "/")
+
+	if len(sources) > 1 && !destIsDir {
+		return fmt.Errorf("COPY with multiple sources requires destination directory")
 	}
 
-	if strings.HasSuffix(dst, "/") {
-		destPath = filepath.Join(destPath, filepath.Base(sourcePath))
+	for _, src := range sources {
+		sourcePath := filepath.Join(contextDir, filepath.FromSlash(src))
+		info, err := os.Stat(sourcePath)
+		if err != nil {
+			return fmt.Errorf("stat COPY source %q: %w", sourcePath, err)
+		}
+
+		targetPath := destPath
+		if len(sources) > 1 || destIsDir {
+			targetPath = filepath.Join(destPath, filepath.Base(sourcePath))
+		}
+
+		if info.IsDir() {
+			if err := copyDirectory(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := copyFile(sourcePath, targetPath); err != nil {
+			return err
+		}
 	}
 
-	return copyFile(sourcePath, destPath)
+	return nil
 }
 
 func copyDirectory(src string, dst string) error {
@@ -277,107 +477,56 @@ func copyFile(src string, dst string) error {
 	return nil
 }
 
-func runInRootFS(rootFS string, workDir string, env map[string]string, command string) error {
-	hostWorkDir := filepath.Join(rootFS, trimLeadingSlash(workDir))
-	if err := os.MkdirAll(hostWorkDir, 0o755); err != nil {
-		return fmt.Errorf("create RUN working directory %q: %w", hostWorkDir, err)
-	}
-
-	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Dir = hostWorkDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	mergedEnv := []string{"PATH=" + os.Getenv("PATH")}
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		mergedEnv = append(mergedEnv, key+"="+env[key])
-	}
-	cmd.Env = mergedEnv
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("RUN command %q failed: %w", command, err)
-	}
-
-	return nil
-}
-
-func hashContextPath(contextDir string, relPath string) (string, error) {
-	path := filepath.Join(contextDir, filepath.FromSlash(relPath))
-	info, err := os.Stat(path)
+func snapshotDirectory(source string) (string, error) {
+	snapshot, err := os.MkdirTemp("", "docksmith-pre-step-")
 	if err != nil {
-		return "", fmt.Errorf("stat path %q for hashing: %w", path, err)
+		return "", fmt.Errorf("create pre-step snapshot dir: %w", err)
 	}
 
-	h := sha256.New()
-	if info.IsDir() {
-		paths := make([]string, 0)
-		err := filepath.WalkDir(path, func(p string, d os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			rel, relErr := filepath.Rel(path, p)
-			if relErr != nil {
-				return relErr
-			}
-			paths = append(paths, filepath.ToSlash(rel))
+	if err := filepath.WalkDir(source, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
 			return nil
-		})
+		}
+
+		target := filepath.Join(snapshot, rel)
+		info, err := os.Lstat(path)
 		if err != nil {
-			return "", fmt.Errorf("walk directory %q: %w", path, err)
+			return err
 		}
 
-		sort.Strings(paths)
-		for _, rel := range paths {
-			full := filepath.Join(path, filepath.FromSlash(rel))
-			entryInfo, statErr := os.Lstat(full)
-			if statErr != nil {
-				return "", fmt.Errorf("stat %q: %w", full, statErr)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
 			}
-
-			_, _ = h.Write([]byte(rel))
-			_, _ = h.Write([]byte{0})
-			_, _ = h.Write([]byte(entryInfo.Mode().String()))
-			_, _ = h.Write([]byte{0})
-
-			if entryInfo.Mode().IsRegular() {
-				file, openErr := os.Open(full)
-				if openErr != nil {
-					return "", fmt.Errorf("open %q: %w", full, openErr)
-				}
-				_, copyErr := io.Copy(h, file)
-				closeErr := file.Close()
-				if copyErr != nil {
-					return "", fmt.Errorf("hash %q: %w", full, copyErr)
-				}
-				if closeErr != nil {
-					return "", fmt.Errorf("close %q: %w", full, closeErr)
-				}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
 			}
+			return os.Symlink(linkTarget, target)
 		}
-	} else {
-		file, err := os.Open(path)
-		if err != nil {
-			return "", fmt.Errorf("open file %q: %w", path, err)
-		}
-		_, copyErr := io.Copy(h, file)
-		closeErr := file.Close()
-		if copyErr != nil {
-			return "", fmt.Errorf("hash file %q: %w", path, copyErr)
-		}
-		if closeErr != nil {
-			return "", fmt.Errorf("close file %q: %w", path, closeErr)
-		}
+
+		return copyFile(path, target)
+	}); err != nil {
+		_ = os.RemoveAll(snapshot)
+		return "", fmt.Errorf("create pre-step snapshot: %w", err)
 	}
 
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return snapshot, nil
 }
 
-func hashEnv(env map[string]string) string {
+func serializeEnv(env map[string]string) string {
 	if len(env) == 0 {
 		return ""
 	}
@@ -394,4 +543,153 @@ func hashEnv(env map[string]string) string {
 	}
 
 	return strings.Join(parts, "\n")
+}
+
+func normalizeImageRef(ref string) string {
+	if strings.Contains(ref, ":") {
+		return ref
+	}
+	return ref + ":latest"
+}
+
+func expandCopySources(contextDir string, pattern string) ([]string, error) {
+	cleanPattern := filepath.ToSlash(strings.TrimSpace(pattern))
+	if cleanPattern == "" {
+		return nil, fmt.Errorf("COPY source cannot be empty")
+	}
+
+	matches := make([]string, 0)
+	if strings.Contains(cleanPattern, "**") {
+		re, err := globToRegex(cleanPattern)
+		if err != nil {
+			return nil, err
+		}
+
+		err = filepath.WalkDir(contextDir, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			rel, err := filepath.Rel(contextDir, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			if rel == "." {
+				return nil
+			}
+			if re.MatchString(rel) {
+				matches = append(matches, rel)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("expand COPY pattern %q: %w", pattern, err)
+		}
+	} else {
+		globMatches, err := filepath.Glob(filepath.Join(contextDir, filepath.FromSlash(cleanPattern)))
+		if err != nil {
+			return nil, fmt.Errorf("expand COPY pattern %q: %w", pattern, err)
+		}
+		for _, path := range globMatches {
+			rel, err := filepath.Rel(contextDir, path)
+			if err != nil {
+				return nil, err
+			}
+			matches = append(matches, filepath.ToSlash(rel))
+		}
+	}
+
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("COPY source %q matched no files", pattern)
+	}
+
+	sort.Strings(matches)
+	uniq := matches[:0]
+	for i, m := range matches {
+		if i == 0 || matches[i-1] != m {
+			uniq = append(uniq, m)
+		}
+	}
+
+	return uniq, nil
+}
+
+func globToRegex(pattern string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		switch ch {
+		case '*':
+			if i+1 < len(pattern) && pattern[i+1] == '*' {
+				b.WriteString(".*")
+				i++
+			} else {
+				b.WriteString("[^/]*")
+			}
+		case '?':
+			b.WriteString("[^/]")
+		case '.':
+			b.WriteString("\\.")
+		case '+', '(', ')', '|', '^', '$', '{', '}', '[', ']', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(ch)
+		default:
+			b.WriteByte(ch)
+		}
+	}
+	b.WriteString("$")
+
+	return regexp.Compile(b.String())
+}
+
+func hashCopySources(contextDir string, sources []string) (string, error) {
+	entries := make([]string, 0)
+
+	for _, rel := range sources {
+		abs := filepath.Join(contextDir, filepath.FromSlash(rel))
+		info, err := os.Stat(abs)
+		if err != nil {
+			return "", fmt.Errorf("stat COPY source %q: %w", abs, err)
+		}
+
+		if info.IsDir() {
+			err := filepath.WalkDir(abs, func(path string, d os.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if d.IsDir() {
+					return nil
+				}
+				innerRel, err := filepath.Rel(contextDir, path)
+				if err != nil {
+					return err
+				}
+				entries = append(entries, filepath.ToSlash(innerRel))
+				return nil
+			})
+			if err != nil {
+				return "", fmt.Errorf("walk COPY directory %q: %w", rel, err)
+			}
+			continue
+		}
+
+		entries = append(entries, rel)
+	}
+
+	sort.Strings(entries)
+	h := sha256.New()
+	for _, rel := range entries {
+		abs := filepath.Join(contextDir, filepath.FromSlash(rel))
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			return "", fmt.Errorf("read COPY source %q: %w", rel, err)
+		}
+		_, _ = h.Write([]byte(rel))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(data)
+		_, _ = h.Write([]byte{0})
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
