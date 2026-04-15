@@ -3,6 +3,8 @@ package cmd
 import (
 	"errors"
 	"fmt"
+
+	"docksmith/store"
 )
 
 func HandleRMI(args []string) error {
@@ -15,5 +17,14 @@ func HandleRMI(args []string) error {
 }
 
 func Remove(image string) {
-	fmt.Printf("RMI called with image=%s\n", image)
+	removedLayers, err := store.DeleteImage(image)
+	if err != nil {
+		fmt.Println("Error removing image:", err)
+		return
+	}
+
+	fmt.Printf("Removed image %s\n", image)
+	if len(removedLayers) > 0 {
+		fmt.Printf("Pruned %d unreferenced layer(s)\n", len(removedLayers))
+	}
 }
