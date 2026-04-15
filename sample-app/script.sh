@@ -9,3 +9,4 @@ pwd
 echo ""
 echo "Files in directory:"
 ls -la
+echo "Bonus line added."
