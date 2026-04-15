@@ -2,149 +2,192 @@ package runtime
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"syscall"
 )
 
-const internalExecSpecEnv = "DOCKSMITH_INTERNAL_EXEC_SPEC"
-
+// RunOptions specifies options for running a container
 type RunOptions struct {
 	EnvOverrides map[string]string
 }
 
-type internalExecSpec struct {
-	RootFS  string            `json:"rootfs"`
-	WorkDir string            `json:"workDir"`
-	Cmd     []string          `json:"cmd"`
-	Env     map[string]string `json:"env"`
-}
-
+// RunContainer runs a container from an image
 func RunContainer(image string, opts RunOptions) error {
 	bundleDir, rootFS, manifest, err := PrepareContainerFilesystem(image)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = CleanupContainerFilesystem(bundleDir)
-	}()
+	defer CleanupContainerFilesystem(bundleDir)
+
+	env := make(map[string]string, len(manifest.Config.Env)+len(opts.EnvOverrides))
+	for k, v := range manifest.Config.Env {
+		env[k] = v
+	}
+	for k, v := range opts.EnvOverrides {
+		env[k] = v
+	}
 
 	if len(manifest.Config.Cmd) == 0 {
-		return errors.New("image has no CMD configured")
+		return fmt.Errorf("image %q has no configured command", image)
+	}
+	if manifest.Config.WorkingDir == "" {
+		manifest.Config.WorkingDir = "/"
 	}
 
-	containerEnv := mergeEnvironment(manifest.Config.Env, opts.EnvOverrides)
-	workDir := manifest.Config.WorkingDir
-	if strings.TrimSpace(workDir) == "" {
-		workDir = "/"
+	if runtime.GOOS != "linux" {
+		return executeWithoutIsolation(rootFS, manifest.Config.WorkingDir, manifest.Config.Cmd, env)
 	}
 
-	spec := internalExecSpec{
-		RootFS:  rootFS,
-		WorkDir: workDir,
-		Cmd:     manifest.Config.Cmd,
-		Env:     containerEnv,
+	if err := executeInContainer(rootFS, manifest.Config.WorkingDir, manifest.Config.Cmd, env); err != nil {
+		return fmt.Errorf("run image %q: %w", image, err)
 	}
 
-	return runInternalExec(spec)
+	return nil
 }
 
+// ExecuteInternal is called for internal container execution
 func ExecuteInternal() error {
-	raw := os.Getenv(internalExecSpecEnv)
-	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("missing %s", internalExecSpecEnv)
+	rootFS := os.Getenv("DOCKSMITH_ROOTFS")
+	if rootFS == "" {
+		return fmt.Errorf("missing DOCKSMITH_ROOTFS")
 	}
 
-	var spec internalExecSpec
-	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
-		return fmt.Errorf("decode internal exec spec: %w", err)
+	workingDir := os.Getenv("DOCKSMITH_WORKDIR")
+	if workingDir == "" {
+		workingDir = "/"
 	}
 
-	if len(spec.Cmd) == 0 {
-		return errors.New("internal exec command is empty")
+	rawCmd := os.Getenv("DOCKSMITH_CMD")
+	if rawCmd == "" {
+		return fmt.Errorf("missing DOCKSMITH_CMD")
 	}
 
-	if err := ApplyIsolation(spec.RootFS); err != nil {
+	var cmdParts []string
+	if err := json.Unmarshal([]byte(rawCmd), &cmdParts); err != nil {
+		return fmt.Errorf("decode DOCKSMITH_CMD: %w", err)
+	}
+	if len(cmdParts) == 0 {
+		return fmt.Errorf("DOCKSMITH_CMD cannot be empty")
+	}
+
+	rawEnv := os.Getenv("DOCKSMITH_ENV")
+	env := map[string]string{}
+	if rawEnv != "" {
+		if err := json.Unmarshal([]byte(rawEnv), &env); err != nil {
+			return fmt.Errorf("decode DOCKSMITH_ENV: %w", err)
+		}
+	}
+
+	if _, ok := env["PATH"]; !ok {
+		env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+
+	if err := chrootRootFS(rootFS); err != nil {
 		return err
 	}
 
-	if err := os.Chdir(spec.WorkDir); err != nil {
-		return fmt.Errorf("set working directory %q: %w", spec.WorkDir, err)
+	if err := os.Chdir(workingDir); err != nil {
+		return fmt.Errorf("change to working directory %q: %w", workingDir, err)
 	}
 
-	command := exec.Command(spec.Cmd[0], spec.Cmd[1:]...)
-	command.Stdin = os.Stdin
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	command.Env = flattenEnvMap(spec.Env)
+	path, err := exec.LookPath(cmdParts[0])
+	if err != nil {
+		return fmt.Errorf("resolve command %q: %w", cmdParts[0], err)
+	}
 
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("execute command: %w", err)
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	envList := make([]string, 0, len(keys))
+	for _, key := range keys {
+		envList = append(envList, key+"="+env[key])
+	}
+
+	if err := syscall.Exec(path, cmdParts, envList); err != nil {
+		return fmt.Errorf("exec command %q: %w", cmdParts[0], err)
 	}
 
 	return nil
 }
 
-func runInternalExec(spec internalExecSpec) error {
-	encodedSpec, err := json.Marshal(spec)
+func executeInContainer(rootFS string, workingDir string, cmdParts []string, env map[string]string) error {
+	rawCmd, err := json.Marshal(cmdParts)
 	if err != nil {
-		return fmt.Errorf("encode internal exec spec: %w", err)
+		return fmt.Errorf("encode command: %w", err)
 	}
 
-	exePath, err := os.Executable()
+	rawEnv, err := json.Marshal(env)
 	if err != nil {
-		return fmt.Errorf("resolve docksmith executable path: %w", err)
+		return fmt.Errorf("encode environment: %w", err)
 	}
 
-	child := exec.Command(exePath, "__docksmith_internal_exec")
-	child.Stdin = os.Stdin
-	child.Stdout = os.Stdout
-	child.Stderr = os.Stderr
-	child.Env = append(os.Environ(), internalExecSpecEnv+"="+string(encodedSpec))
+	cmd := exec.Command(os.Args[0], "__docksmith_internal_exec")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Env = append(os.Environ(),
+		"DOCKSMITH_ROOTFS="+rootFS,
+		"DOCKSMITH_WORKDIR="+workingDir,
+		"DOCKSMITH_CMD="+string(rawCmd),
+		"DOCKSMITH_ENV="+string(rawEnv),
+	)
 
-	if err := child.Run(); err != nil {
-		return fmt.Errorf("run container: %w", err)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("internal execution failed: %w", err)
 	}
 
 	return nil
 }
 
-func mergeEnvironment(imageEnv map[string]string, overrides map[string]string) map[string]string {
-	merged := envSliceToMap(os.Environ())
-
-	for key, value := range imageEnv {
-		merged[key] = value
+func executeWithoutIsolation(rootFS string, workingDir string, cmdParts []string, env map[string]string) error {
+	workHostPath := filepath.Join(rootFS, trimLeadingSlash(workingDir))
+	if err := os.MkdirAll(workHostPath, 0o755); err != nil {
+		return fmt.Errorf("create working directory %q: %w", workHostPath, err)
 	}
 
-	for key, value := range overrides {
-		merged[key] = value
+	cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+	cmd.Dir = workHostPath
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
 	}
+	sort.Strings(keys)
 
-	return merged
-}
-
-func envSliceToMap(values []string) map[string]string {
-	env := make(map[string]string, len(values))
-
-	for _, item := range values {
-		parts := strings.SplitN(item, "=", 2)
-		if len(parts) != 2 {
-			continue
+	envList := make([]string, 0, len(keys)+1)
+	hasPath := false
+	for _, key := range keys {
+		if key == "PATH" {
+			hasPath = true
 		}
-		env[parts[0]] = parts[1]
+		envList = append(envList, key+"="+env[key])
+	}
+	if !hasPath {
+		envList = append(envList, "PATH="+os.Getenv("PATH"))
+	}
+	cmd.Env = envList
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("run command without isolation: %w", err)
 	}
 
-	return env
+	return nil
 }
 
-func flattenEnvMap(values map[string]string) []string {
-	flat := make([]string, 0, len(values))
-
-	for key, value := range values {
-		flat = append(flat, key+"="+value)
+func trimLeadingSlash(path string) string {
+	for len(path) > 0 && path[0] == '/' {
+		path = path[1:]
 	}
-
-	return flat
+	return path
 }
