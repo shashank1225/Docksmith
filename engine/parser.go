@@ -60,15 +60,12 @@ func ParseBuildFile(contextDir string) (*BuildSpec, error) {
 }
 
 func resolveBuildFile(contextDir string) (string, error) {
-	candidates := []string{"Docksmithfile", "Dockerfile"}
-	for _, name := range candidates {
-		path := filepath.Join(contextDir, name)
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			return path, nil
-		}
+	path := filepath.Join(contextDir, "Docksmithfile")
+	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		return path, nil
 	}
 
-	return "", fmt.Errorf("no Docksmithfile or Dockerfile found in context %q", contextDir)
+	return "", fmt.Errorf("no Docksmithfile found in context %q", contextDir)
 }
 
 func parseInstructionLine(line string, lineNo int) (Instruction, error) {

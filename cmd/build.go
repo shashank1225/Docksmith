@@ -13,7 +13,9 @@ func HandleBuild(args []string) error {
 	fs.SetOutput(io.Discard)
 
 	var tag string
+	var noCache bool
 	fs.StringVar(&tag, "t", "", "image name and tag")
+	fs.BoolVar(&noCache, "no-cache", false, "disable build cache")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -28,9 +30,9 @@ func HandleBuild(args []string) error {
 		return errors.New("build requires exactly one context path")
 	}
 
-	return Build(tag, remaining[0])
+	return Build(tag, remaining[0], noCache)
 }
 
-func Build(tag string, context string) error {
-	return engine.Build(tag, context)
+func Build(tag string, context string, noCache bool) error {
+	return engine.Build(tag, context, engine.BuildOptions{NoCache: noCache})
 }

@@ -22,15 +22,21 @@ func HandleRun(args []string) error {
 	}
 
 	remaining := fs.Args()
-	if len(remaining) != 1 {
-		return errors.New("run requires exactly one image <name:tag>")
+	if len(remaining) < 1 {
+		return errors.New("run requires at least one image <name:tag>")
 	}
 
-	return Run(remaining[0], envFlags.toMap())
+	image := remaining[0]
+	command := []string{}
+	if len(remaining) > 1 {
+		command = remaining[1:]
+	}
+
+	return Run(image, envFlags.toMap(), command)
 }
 
-func Run(image string, envOverrides map[string]string) error {
-	if err := dockruntime.RunContainer(image, dockruntime.RunOptions{EnvOverrides: envOverrides}); err != nil {
+func Run(image string, envOverrides map[string]string, command []string) error {
+	if err := dockruntime.RunContainer(image, dockruntime.RunOptions{EnvOverrides: envOverrides, Command: command}); err != nil {
 		return fmt.Errorf("run image %q: %w", image, err)
 	}
 

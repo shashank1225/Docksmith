@@ -3,6 +3,7 @@ package cache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,7 +46,8 @@ func LayerPath(digest string) (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(root, "layers", digest+".tar"), nil
+	fileDigest := strings.ReplaceAll(digest, ":", "_")
+	return filepath.Join(root, "layers", fileDigest+".tar"), nil
 }
 
 func ImagePath(name string, tag string) (string, error) {
@@ -65,5 +67,66 @@ func HashParts(parts ...string) string {
 		_, _ = h.Write([]byte{0})
 	}
 
-	return "sha256_" + hex.EncodeToString(h.Sum(nil))
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+func CacheIndexPath() (string, error) {
+	root, err := RootDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(root, "cache", "index.json"), nil
+}
+
+func LoadCacheIndex() (map[string]string, error) {
+	if err := EnsureLayout(); err != nil {
+		return nil, err
+	}
+
+	path, err := CacheIndexPath()
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return map[string]string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open cache index %q: %w", path, err)
+	}
+	defer file.Close()
+
+	index := map[string]string{}
+	if err := json.NewDecoder(file).Decode(&index); err != nil {
+		return nil, fmt.Errorf("decode cache index %q: %w", path, err)
+	}
+
+	return index, nil
+}
+
+func SaveCacheIndex(index map[string]string) error {
+	if err := EnsureLayout(); err != nil {
+		return err
+	}
+
+	path, err := CacheIndexPath()
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create cache index %q: %w", path, err)
+	}
+	defer file.Close()
+
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(index); err != nil {
+		return fmt.Errorf("write cache index %q: %w", path, err)
+	}
+
+	return nil
 }

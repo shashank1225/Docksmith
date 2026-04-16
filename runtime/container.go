@@ -1,11 +1,11 @@
 package runtime
 
 import (
+	"docksmith/store"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"syscall"
@@ -14,40 +14,53 @@ import (
 // RunOptions specifies options for running a container
 type RunOptions struct {
 	EnvOverrides map[string]string
+	Command      []string
 }
 
 // RunContainer runs a container from an image
 func RunContainer(image string, opts RunOptions) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("container runtime requires Linux")
+	}
+
 	bundleDir, rootFS, manifest, err := PrepareContainerFilesystem(image)
 	if err != nil {
 		return err
 	}
 	defer CleanupContainerFilesystem(bundleDir)
 
-	env := make(map[string]string, len(manifest.Config.Env)+len(opts.EnvOverrides))
-	for k, v := range manifest.Config.Env {
-		env[k] = v
-	}
+	env := store.EnvListToMap(manifest.Config.Env)
 	for k, v := range opts.EnvOverrides {
 		env[k] = v
 	}
 
-	if len(manifest.Config.Cmd) == 0 {
+	command := manifest.Config.Cmd
+	if len(opts.Command) > 0 {
+		command = opts.Command
+	}
+
+	if len(command) == 0 {
 		return fmt.Errorf("image %q has no configured command", image)
 	}
 	if manifest.Config.WorkingDir == "" {
 		manifest.Config.WorkingDir = "/"
 	}
 
-	if runtime.GOOS != "linux" {
-		return executeWithoutIsolation(rootFS, manifest.Config.WorkingDir, manifest.Config.Cmd, env)
-	}
-
-	if err := executeInContainer(rootFS, manifest.Config.WorkingDir, manifest.Config.Cmd, env); err != nil {
+	if err := executeInContainer(rootFS, manifest.Config.WorkingDir, command, env); err != nil {
 		return fmt.Errorf("run image %q: %w", image, err)
 	}
 
 	return nil
+}
+
+func ExecuteShellInRootFS(rootFS string, workingDir string, env map[string]string, command string) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("RUN requires Linux isolation")
+	}
+
+	cmdParts := []string{"/bin/sh", "-c", command}
+
+	return executeInContainer(rootFS, workingDir, cmdParts, env)
 }
 
 // ExecuteInternal is called for internal container execution
@@ -145,49 +158,4 @@ func executeInContainer(rootFS string, workingDir string, cmdParts []string, env
 	}
 
 	return nil
-}
-
-func executeWithoutIsolation(rootFS string, workingDir string, cmdParts []string, env map[string]string) error {
-	workHostPath := filepath.Join(rootFS, trimLeadingSlash(workingDir))
-	if err := os.MkdirAll(workHostPath, 0o755); err != nil {
-		return fmt.Errorf("create working directory %q: %w", workHostPath, err)
-	}
-
-	cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
-	cmd.Dir = workHostPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	envList := make([]string, 0, len(keys)+1)
-	hasPath := false
-	for _, key := range keys {
-		if key == "PATH" {
-			hasPath = true
-		}
-		envList = append(envList, key+"="+env[key])
-	}
-	if !hasPath {
-		envList = append(envList, "PATH="+os.Getenv("PATH"))
-	}
-	cmd.Env = envList
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("run command without isolation: %w", err)
-	}
-
-	return nil
-}
-
-func trimLeadingSlash(path string) string {
-	for len(path) > 0 && path[0] == '/' {
-		path = path[1:]
-	}
-	return path
 }
