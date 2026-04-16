@@ -35,9 +35,7 @@ func PrepareContainerFilesystem(imageRef string) (string, string, *store.ImageMa
 		}
 	}
 
-	if manifest.Config.Env == nil {
-		manifest.Config.Env = map[string]string{}
-	}
+	manifest.Config.Env = store.NormalizeEnvList(manifest.Config.Env)
 
 	return bundleDir, rootFS, manifest, nil
 }

@@ -62,9 +62,10 @@ func Build(tag string, context string, opts BuildOptions) error {
 	defer os.RemoveAll(rootFS)
 
 	imageConfig := store.ImageConfig{
-		Env:        map[string]string{},
+		Env:        []string{},
 		WorkingDir: "/",
 	}
+	envMap := map[string]string{}
 
 	manifestLayers := make([]store.LayerDescriptor, 0)
 	prevDigest := ""
@@ -100,9 +101,8 @@ func Build(tag string, context string, opts BuildOptions) error {
 			if imageConfig.WorkingDir == "" {
 				imageConfig.WorkingDir = "/"
 			}
-			for k, v := range baseManifest.Config.Env {
-				imageConfig.Env[k] = v
-			}
+			envMap = store.EnvListToMap(baseManifest.Config.Env)
+			imageConfig.Env = store.EnvMapToList(envMap)
 			if len(baseManifest.Config.Cmd) > 0 {
 				imageConfig.Cmd = append([]string{}, baseManifest.Config.Cmd...)
 			}
@@ -112,7 +112,8 @@ func Build(tag string, context string, opts BuildOptions) error {
 			if err != nil {
 				return fmt.Errorf("line %d: %w", inst.Line, err)
 			}
-			imageConfig.Env[key] = value
+			envMap[key] = value
+			imageConfig.Env = store.EnvMapToList(envMap)
 		case "WORKDIR":
 			imageConfig.WorkingDir = normalizeContainerPath(imageConfig.WorkingDir, inst.Args[0])
 			pendingWorkdirCreate = true
@@ -147,7 +148,7 @@ func Build(tag string, context string, opts BuildOptions) error {
 				prevDigest,
 				inst.Raw,
 				imageConfig.WorkingDir,
-				serializeEnv(imageConfig.Env),
+				serializeEnv(envMap),
 				sourceHash,
 			)
 
@@ -192,11 +193,11 @@ func Build(tag string, context string, opts BuildOptions) error {
 				prevDigest,
 				inst.Raw,
 				imageConfig.WorkingDir,
-				serializeEnv(imageConfig.Env),
+				serializeEnv(envMap),
 			)
 
 			stepStart := time.Now()
-			digest, size, hit, err := runCommandStep(rootFS, imageConfig.WorkingDir, imageConfig.Env, inst.Args[0], inst.Raw, cacheKey, cacheIndex, opts.NoCache, cascadeMiss)
+			digest, size, hit, err := runCommandStep(rootFS, imageConfig.WorkingDir, envMap, inst.Args[0], inst.Raw, cacheKey, cacheIndex, opts.NoCache, cascadeMiss)
 			if err != nil {
 				return err
 			}

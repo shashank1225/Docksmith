@@ -15,9 +15,9 @@ import (
 )
 
 type ImageConfig struct {
-	Env        map[string]string `json:"Env"`
-	Cmd        []string          `json:"Cmd"`
-	WorkingDir string            `json:"WorkingDir"`
+	Env        []string `json:"Env"`
+	Cmd        []string `json:"Cmd"`
+	WorkingDir string   `json:"WorkingDir"`
 }
 
 type LayerDescriptor struct {
@@ -40,9 +40,7 @@ func SaveImage(manifest ImageManifest) error {
 		return fmt.Errorf("image manifest must include name and tag")
 	}
 
-	if manifest.Config.Env == nil {
-		manifest.Config.Env = map[string]string{}
-	}
+	manifest.Config.Env = NormalizeEnvList(manifest.Config.Env)
 	if manifest.Config.WorkingDir == "" {
 		manifest.Config.WorkingDir = "/"
 	}
@@ -125,9 +123,7 @@ func LoadImage(imageRef string) (*ImageManifest, error) {
 		return nil, fmt.Errorf("decode image manifest %q: %w", path, err)
 	}
 
-	if manifest.Config.Env == nil {
-		manifest.Config.Env = map[string]string{}
-	}
+	manifest.Config.Env = NormalizeEnvList(manifest.Config.Env)
 	if manifest.Config.WorkingDir == "" {
 		manifest.Config.WorkingDir = "/"
 	}
@@ -236,4 +232,65 @@ func ParseImageReference(imageRef string) (string, string, error) {
 	}
 
 	return name, tag, nil
+}
+
+func NormalizeEnvList(env []string) []string {
+	if len(env) == 0 {
+		return []string{}
+	}
+
+	values := make(map[string]string, len(env))
+	for _, item := range env {
+		parts := strings.SplitN(item, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		if key == "" {
+			continue
+		}
+		values[key] = parts[1]
+	}
+
+	return EnvMapToList(values)
+}
+
+func EnvMapToList(env map[string]string) []string {
+	if len(env) == 0 {
+		return []string{}
+	}
+
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+
+	return out
+}
+
+func EnvListToMap(env []string) map[string]string {
+	if len(env) == 0 {
+		return map[string]string{}
+	}
+
+	out := make(map[string]string, len(env))
+	for _, item := range env {
+		parts := strings.SplitN(item, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		if key == "" {
+			continue
+		}
+		out[key] = parts[1]
+	}
+
+	return out
 }

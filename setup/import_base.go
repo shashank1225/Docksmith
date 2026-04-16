@@ -83,9 +83,7 @@ func main() {
 		Tag:     "3.18",
 		Created: time.Now().UTC().Format(time.RFC3339),
 		Config: store.ImageConfig{
-			Env: map[string]string{
-				"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-			},
+			Env:        []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 			WorkingDir: "/",
 			Cmd:        []string{"/bin/sh"},
 		},
