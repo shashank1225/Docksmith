@@ -1,0 +1,16 @@
+FROM alpine:3.18
+
+# Define an environment variable (can be overridden at runtime with `docksmith run -e`)
+ENV GREETING=Hello
+
+# Set the working directory
+WORKDIR /app
+
+# Copy the demo script into the image
+COPY script.sh .
+
+# Make the script executable
+RUN chmod +x script.sh
+
+# Default command for the demo image
+CMD ["/app/script.sh"]

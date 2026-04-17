@@ -11,7 +11,7 @@ import (
 )
 
 func PrepareContainerFilesystem(imageRef string) (string, string, *store.ImageManifest, error) {
-	bundleDir, err := os.MkdirTemp("/tmp", "docksmith-container-")
+	bundleDir, err := os.MkdirTemp("", "docksmith-container-")
 	if err != nil {
 		return "", "", nil, fmt.Errorf("create container bundle directory: %w", err)
 	}

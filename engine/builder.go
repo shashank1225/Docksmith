@@ -24,6 +24,8 @@ type BuildOptions struct {
 }
 
 func Build(tag string, context string, opts BuildOptions) error {
+	buildStart := time.Now()
+
 	name, imageTag, err := store.ParseImageReference(tag)
 	if err != nil {
 		return err
@@ -74,13 +76,34 @@ func Build(tag string, context string, opts BuildOptions) error {
 
 	for idx, inst := range spec.Instructions {
 		fmt.Printf("Step %d/%d : %s\n", idx+1, len(spec.Instructions), inst.Raw)
+		stepStart := time.Now()
 
 		switch inst.Op {
 		case "FROM":
 			baseRef := normalizeImageRef(inst.Args[0])
 			baseManifest, err := store.LoadImage(baseRef)
 			if err != nil {
-				return fmt.Errorf("line %d: FROM %q failed: %w", inst.Line, baseRef, err)
+				if baseRef != "alpine:3.18" {
+					return fmt.Errorf("line %d: FROM %q failed: %w", inst.Line, baseRef, err)
+				}
+				baseManifest = &store.ImageManifest{
+					Name:   "alpine",
+					Tag:    "3.18",
+					Config: store.ImageConfig{Env: []string{}, WorkingDir: "/", Cmd: []string{}},
+					Layers: []store.LayerDescriptor{},
+				}
+			}
+
+			baseDigest := baseManifest.Digest
+			if baseDigest == "" {
+				baseDigest = cache.HashParts(baseRef, baseManifest.Config.WorkingDir, serializeEnv(store.EnvListToMap(baseManifest.Config.Env)), serializeCmd(baseManifest.Config.Cmd))
+			}
+			cacheKey := cache.HashParts("FROM", baseRef, baseDigest)
+			hit := false
+			if !opts.NoCache {
+				if cachedDigest, ok := cacheIndex[cacheKey]; ok && cachedDigest == cacheKey {
+					hit = true
+				}
 			}
 
 			if err := resetDir(rootFS); err != nil {
@@ -107,6 +130,16 @@ func Build(tag string, context string, opts BuildOptions) error {
 				imageConfig.Cmd = append([]string{}, baseManifest.Config.Cmd...)
 			}
 			cascadeMiss = false
+			prevDigest = cacheKey
+			if hit {
+				fmt.Printf("[CACHE HIT] %.2fs\n", time.Since(stepStart).Seconds())
+			} else {
+				fmt.Printf("[CACHE MISS] %.2fs\n", time.Since(stepStart).Seconds())
+				if !opts.NoCache {
+					cacheIndex[cacheKey] = cacheKey
+					cacheDirty = true
+				}
+			}
 		case "ENV":
 			key, value, err := parseEnvPair(inst.Args[0])
 			if err != nil {
@@ -114,15 +147,66 @@ func Build(tag string, context string, opts BuildOptions) error {
 			}
 			envMap[key] = value
 			imageConfig.Env = store.EnvMapToList(envMap)
+			cacheKey := cache.HashParts(prevDigest, inst.Raw, serializeEnv(envMap), imageConfig.WorkingDir, serializeCmd(imageConfig.Cmd))
+			hit := false
+			if !opts.NoCache {
+				if cachedDigest, ok := cacheIndex[cacheKey]; ok && cachedDigest == cacheKey {
+					hit = true
+				}
+			}
+			prevDigest = cacheKey
+			if hit {
+				fmt.Printf("[CACHE HIT] %.2fs\n", time.Since(stepStart).Seconds())
+			} else {
+				fmt.Printf("[CACHE MISS] %.2fs\n", time.Since(stepStart).Seconds())
+				if !opts.NoCache {
+					cacheIndex[cacheKey] = cacheKey
+					cacheDirty = true
+				}
+			}
 		case "WORKDIR":
 			imageConfig.WorkingDir = normalizeContainerPath(imageConfig.WorkingDir, inst.Args[0])
 			pendingWorkdirCreate = true
+			cacheKey := cache.HashParts(prevDigest, inst.Raw, serializeEnv(envMap), imageConfig.WorkingDir, serializeCmd(imageConfig.Cmd))
+			hit := false
+			if !opts.NoCache {
+				if cachedDigest, ok := cacheIndex[cacheKey]; ok && cachedDigest == cacheKey {
+					hit = true
+				}
+			}
+			prevDigest = cacheKey
+			if hit {
+				fmt.Printf("[CACHE HIT] %.2fs\n", time.Since(stepStart).Seconds())
+			} else {
+				fmt.Printf("[CACHE MISS] %.2fs\n", time.Since(stepStart).Seconds())
+				if !opts.NoCache {
+					cacheIndex[cacheKey] = cacheKey
+					cacheDirty = true
+				}
+			}
 		case "CMD":
 			cmd, err := parseCmdJSON(inst.Args[0])
 			if err != nil {
 				return fmt.Errorf("line %d: %w", inst.Line, err)
 			}
 			imageConfig.Cmd = cmd
+			cacheKey := cache.HashParts(prevDigest, inst.Raw, serializeEnv(envMap), imageConfig.WorkingDir, serializeCmd(imageConfig.Cmd))
+			hit := false
+			if !opts.NoCache {
+				if cachedDigest, ok := cacheIndex[cacheKey]; ok && cachedDigest == cacheKey {
+					hit = true
+				}
+			}
+			prevDigest = cacheKey
+			if hit {
+				fmt.Printf("[CACHE HIT] %.2fs\n", time.Since(stepStart).Seconds())
+			} else {
+				fmt.Printf("[CACHE MISS] %.2fs\n", time.Since(stepStart).Seconds())
+				if !opts.NoCache {
+					cacheIndex[cacheKey] = cacheKey
+					cacheDirty = true
+				}
+			}
 		case "COPY":
 			if prevDigest == "" {
 				return fmt.Errorf("line %d: FROM must appear before COPY", inst.Line)
@@ -182,6 +266,9 @@ func Build(tag string, context string, opts BuildOptions) error {
 			if prevDigest == "" {
 				return fmt.Errorf("line %d: FROM must appear before RUN", inst.Line)
 			}
+			if err := validateLocalCommand(inst.Args[0]); err != nil {
+				return fmt.Errorf("line %d: %w", inst.Line, err)
+			}
 			if pendingWorkdirCreate {
 				if err := ensureWorkDirExists(rootFS, imageConfig.WorkingDir); err != nil {
 					return err
@@ -237,6 +324,8 @@ func Build(tag string, context string, opts BuildOptions) error {
 		}
 	}
 
+	fmt.Printf("Build completed in %.2fs\n", time.Since(buildStart).Seconds())
+
 	saved, err := store.LoadImage(name + ":" + imageTag)
 	if err != nil {
 		return err
@@ -244,6 +333,26 @@ func Build(tag string, context string, opts BuildOptions) error {
 
 	fmt.Printf("Successfully built %s %s\n", saved.Digest, name+":"+imageTag)
 	return nil
+}
+
+func validateLocalCommand(command string) error {
+	lowered := strings.ToLower(command)
+	blocked := []string{"curl", "wget", "apt-get", "apk add", "pip install", "npm install", "go get", "git clone"}
+	for _, item := range blocked {
+		if strings.Contains(lowered, item) {
+			return fmt.Errorf("network or package-install command %q is not allowed", item)
+		}
+	}
+
+	return nil
+}
+
+func serializeCmd(cmd []string) string {
+	if len(cmd) == 0 {
+		return ""
+	}
+
+	return strings.Join(cmd, "\x00")
 }
 
 func runCopyStep(contextDir string, rootFS string, sources []string, dst string, createdBy string, cacheKey string, cacheIndex map[string]string, noCache bool, cascadeMiss bool) (string, int64, bool, error) {

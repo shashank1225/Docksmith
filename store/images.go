@@ -192,21 +192,6 @@ func DeleteImage(imageRef string) ([]string, error) {
 		return nil, err
 	}
 
-	images, err := ListImages()
-	if err != nil {
-		return nil, err
-	}
-
-	referencedByOtherImages := make(map[string]struct{})
-	for _, img := range images {
-		if img.Name == name && img.Tag == tag {
-			continue
-		}
-		for _, layer := range img.Layers {
-			referencedByOtherImages[layer.Digest] = struct{}{}
-		}
-	}
-
 	path, err := cache.ImagePath(name, tag)
 	if err != nil {
 		return nil, err
@@ -218,10 +203,6 @@ func DeleteImage(imageRef string) ([]string, error) {
 
 	removed := make([]string, 0)
 	for _, layer := range target.Layers {
-		if _, inUse := referencedByOtherImages[layer.Digest]; inUse {
-			continue
-		}
-
 		layerPath, err := cache.LayerPath(layer.Digest)
 		if err != nil {
 			return nil, err
