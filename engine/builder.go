@@ -558,6 +558,9 @@ func expandCopySources(contextDir string, pattern string) ([]string, error) {
 	if cleanPattern == "" {
 		return nil, fmt.Errorf("COPY source cannot be empty")
 	}
+	if filepath.IsAbs(filepath.FromSlash(cleanPattern)) || strings.HasPrefix(cleanPattern, "/") {
+		return nil, fmt.Errorf("COPY source %q must be relative to the build context", pattern)
+	}
 
 	matches := make([]string, 0)
 	if strings.Contains(cleanPattern, "**") {
@@ -596,7 +599,11 @@ func expandCopySources(contextDir string, pattern string) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
-			matches = append(matches, filepath.ToSlash(rel))
+			rel = filepath.ToSlash(rel)
+			if !isPathWithinContext(rel) {
+				return nil, fmt.Errorf("COPY source %q resolves outside build context", pattern)
+			}
+			matches = append(matches, rel)
 		}
 	}
 
@@ -608,6 +615,9 @@ func expandCopySources(contextDir string, pattern string) ([]string, error) {
 	uniq := matches[:0]
 	for i, m := range matches {
 		if i == 0 || matches[i-1] != m {
+			if !isPathWithinContext(m) {
+				return nil, fmt.Errorf("COPY source %q resolves outside build context", m)
+			}
 			uniq = append(uniq, m)
 		}
 	}
@@ -615,6 +625,19 @@ func expandCopySources(contextDir string, pattern string) ([]string, error) {
 	return uniq, nil
 }
 
+func isPathWithinContext(rel string) bool {
+	clean := filepath.ToSlash(filepath.Clean(rel))
+	if clean == "." || clean == "" {
+		return false
+	}
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return false
+	}
+	if filepath.IsAbs(filepath.FromSlash(clean)) || strings.HasPrefix(clean, "/") {
+		return false
+	}
+	return true
+}
 func globToRegex(pattern string) (*regexp.Regexp, error) {
 	var b strings.Builder
 	b.WriteString("^")
@@ -648,6 +671,10 @@ func hashCopySources(contextDir string, sources []string) (string, error) {
 	entries := make([]string, 0)
 
 	for _, rel := range sources {
+		if !isPathWithinContext(rel) {
+			return "", fmt.Errorf("COPY source %q resolves outside build context", rel)
+		}
+
 		abs := filepath.Join(contextDir, filepath.FromSlash(rel))
 		info, err := os.Stat(abs)
 		if err != nil {
@@ -666,7 +693,11 @@ func hashCopySources(contextDir string, sources []string) (string, error) {
 				if err != nil {
 					return err
 				}
-				entries = append(entries, filepath.ToSlash(innerRel))
+				innerRel = filepath.ToSlash(innerRel)
+				if !isPathWithinContext(innerRel) {
+					return fmt.Errorf("COPY source %q resolves outside build context", innerRel)
+				}
+				entries = append(entries, innerRel)
 				return nil
 			})
 			if err != nil {

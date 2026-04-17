@@ -16,6 +16,11 @@ import (
 	"docksmith/cache"
 )
 
+type deltaEntry struct {
+	path     string
+	whiteout bool
+}
+
 func LayerExists(digest string) (bool, error) {
 	path, err := cache.LayerPath(digest)
 	if err != nil {
@@ -65,14 +70,37 @@ func WriteDeltaLayer(previousDir string, currentDir string) (string, int64, erro
 	}
 
 	w := tar.NewWriter(file)
-	paths, err := changedPaths(previousDir, currentDir)
+	entries, err := changedPaths(previousDir, currentDir)
 	if err != nil {
 		_ = w.Close()
 		_ = file.Close()
 		return "", 0, err
 	}
 
-	for _, rel := range paths {
+	for _, entry := range entries {
+		if entry.whiteout {
+			hdr := &tar.Header{
+				Name:       entry.path,
+				Typeflag:   tar.TypeReg,
+				Mode:       0o644,
+				Size:       0,
+				ModTime:    time.Unix(0, 0),
+				AccessTime: time.Unix(0, 0),
+				ChangeTime: time.Unix(0, 0),
+				Uid:        0,
+				Gid:        0,
+				Uname:      "",
+				Gname:      "",
+			}
+			if err := w.WriteHeader(hdr); err != nil {
+				_ = w.Close()
+				_ = file.Close()
+				return "", 0, fmt.Errorf("write whiteout header for %q: %w", entry.path, err)
+			}
+			continue
+		}
+
+		rel := entry.path
 		abs := filepath.Join(currentDir, filepath.FromSlash(rel))
 		info, err := os.Lstat(abs)
 		if err != nil {
@@ -172,8 +200,21 @@ func WriteDeltaLayer(previousDir string, currentDir string) (string, int64, erro
 	return digest, size, nil
 }
 
-func changedPaths(previousDir string, currentDir string) ([]string, error) {
-	paths := make([]string, 0)
+func changedPaths(previousDir string, currentDir string) ([]deltaEntry, error) {
+	entries := make([]deltaEntry, 0)
+	seen := make(map[string]struct{})
+
+	addEntry := func(path string, whiteout bool) {
+		key := path + "|f"
+		if whiteout {
+			key = path + "|w"
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		entries = append(entries, deltaEntry{path: path, whiteout: whiteout})
+	}
 
 	err := filepath.WalkDir(currentDir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -197,7 +238,7 @@ func changedPaths(previousDir string, currentDir string) ([]string, error) {
 		prevPath := filepath.Join(previousDir, filepath.FromSlash(rel))
 		prevInfo, prevErr := os.Lstat(prevPath)
 		if os.IsNotExist(prevErr) {
-			paths = append(paths, rel)
+			addEntry(rel, false)
 			return nil
 		}
 		if prevErr != nil {
@@ -209,7 +250,7 @@ func changedPaths(previousDir string, currentDir string) ([]string, error) {
 			return err
 		}
 		if changed {
-			paths = append(paths, rel)
+			addEntry(rel, false)
 		}
 
 		return nil
@@ -218,8 +259,103 @@ func changedPaths(previousDir string, currentDir string) ([]string, error) {
 		return nil, fmt.Errorf("walk current layer source %q: %w", currentDir, err)
 	}
 
-	sort.Strings(paths)
-	return paths, nil
+	deletedRoots := make(map[string]struct{})
+	err = filepath.WalkDir(previousDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == previousDir {
+			return nil
+		}
+
+		rel, err := filepath.Rel(previousDir, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+
+		if hasDeletedAncestor(rel, deletedRoots) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		currPath := filepath.Join(currentDir, filepath.FromSlash(rel))
+		if _, err := os.Lstat(currPath); os.IsNotExist(err) {
+			addEntry(whiteoutPath(rel), true)
+			deletedRoots[rel] = struct{}{}
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		} else if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk previous layer source %q: %w", previousDir, err)
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].path == entries[j].path {
+			if entries[i].whiteout == entries[j].whiteout {
+				return false
+			}
+			return entries[i].whiteout
+		}
+		return entries[i].path < entries[j].path
+	})
+
+	return entries, nil
+}
+
+func hasDeletedAncestor(path string, deletedRoots map[string]struct{}) bool {
+	parts := strings.Split(path, "/")
+	if len(parts) <= 1 {
+		return false
+	}
+
+	prefix := parts[0]
+	for i := 1; i < len(parts)-1; i++ {
+		if _, ok := deletedRoots[prefix]; ok {
+			return true
+		}
+		prefix += "/" + parts[i]
+	}
+
+	return false
+}
+
+func whiteoutPath(path string) string {
+	dir := filepath.ToSlash(filepath.Dir(path))
+	base := filepath.Base(path)
+	whiteout := ".wh." + base
+	if dir == "." {
+		return whiteout
+	}
+	return filepath.ToSlash(filepath.Join(dir, whiteout))
+}
+
+func whiteoutTarget(path string) (string, bool) {
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, ".wh.") {
+		return "", false
+	}
+
+	stripped := strings.TrimPrefix(base, ".wh.")
+	if stripped == "" {
+		return "", false
+	}
+
+	dir := filepath.ToSlash(filepath.Dir(path))
+	if dir == "." {
+		return stripped, true
+	}
+
+	return filepath.ToSlash(filepath.Join(dir, stripped)), true
 }
 
 func fileChanged(prevPath string, prevInfo os.FileInfo, currentPath string, currentInfo os.FileInfo) (bool, error) {
@@ -326,6 +462,17 @@ func ExtractLayer(digest string, targetDir string) error {
 		targetPath := filepath.Join(targetDir, cleanName)
 		if !strings.HasPrefix(targetPath, filepath.Clean(targetDir)+string(filepath.Separator)) && filepath.Clean(targetPath) != filepath.Clean(targetDir) {
 			return fmt.Errorf("path traversal attempt %q in layer %q", hdr.Name, layerPath)
+		}
+
+		if removeRel, ok := whiteoutTarget(cleanName); ok {
+			removePath := filepath.Join(targetDir, filepath.FromSlash(removeRel))
+			if !strings.HasPrefix(filepath.Clean(removePath), filepath.Clean(targetDir)+string(filepath.Separator)) && filepath.Clean(removePath) != filepath.Clean(targetDir) {
+				return fmt.Errorf("whiteout path traversal attempt %q in layer %q", hdr.Name, layerPath)
+			}
+			if err := os.RemoveAll(removePath); err != nil {
+				return fmt.Errorf("apply whiteout %q: %w", removePath, err)
+			}
+			continue
 		}
 
 		switch hdr.Typeflag {

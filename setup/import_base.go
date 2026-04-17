@@ -6,39 +6,41 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"docksmith/cache"
 	"docksmith/store"
 )
 
-const alpineURL = "https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/x86_64/alpine-minirootfs-3.18.4-x86_64.tar.gz"
-
 func main() {
-	fmt.Println("Downloading Alpine base image...")
+	if len(os.Args) != 2 {
+		fmt.Fprintf(os.Stderr, "Usage: %s <alpine-rootfs.tar|alpine-rootfs.tar.gz>\n", filepath.Base(os.Args[0]))
+		os.Exit(1)
+	}
 
-	// 1. Download tar.gz
-	resp, err := http.Get(alpineURL)
+	sourcePath := os.Args[1]
+	fmt.Printf("Importing Alpine base image from %s...\n", sourcePath)
+
+	sourceFile, err := os.Open(sourcePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error downloading Alpine image: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error opening source file: %v\n", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
+	defer sourceFile.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Error: received status code %d\n", resp.StatusCode)
-		os.Exit(1)
+	reader := io.Reader(sourceFile)
+	if strings.HasSuffix(strings.ToLower(sourcePath), ".gz") {
+		gz, err := gzip.NewReader(sourceFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating gzip reader: %v\n", err)
+			os.Exit(1)
+		}
+		defer gz.Close()
+		reader = gz
 	}
-
-	// 2. Unzip on the fly to get raw tar, compute hash and size
-	gz, err := gzip.NewReader(resp.Body)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating gzip reader: %v\n", err)
-		os.Exit(1)
-	}
-	defer gz.Close()
 
 	tmpFile, err := os.CreateTemp("", "alpine-*.tar")
 	if err != nil {
@@ -50,7 +52,7 @@ func main() {
 	hash := sha256.New()
 	multiWriter := io.MultiWriter(tmpFile, hash)
 
-	size, err := io.Copy(multiWriter, gz)
+	size, err := io.Copy(multiWriter, reader)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error extracting tar: %v\n", err)
 		os.Exit(1)
