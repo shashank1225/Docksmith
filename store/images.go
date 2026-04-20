@@ -201,8 +201,17 @@ func DeleteImage(imageRef string) ([]string, error) {
 		return nil, fmt.Errorf("remove image manifest %q: %w", path, err)
 	}
 
+	referenced, err := referencedLayerDigests()
+	if err != nil {
+		return nil, err
+	}
+
 	removed := make([]string, 0)
 	for _, layer := range target.Layers {
+		if _, inUse := referenced[layer.Digest]; inUse {
+			continue
+		}
+
 		layerPath, err := cache.LayerPath(layer.Digest)
 		if err != nil {
 			return nil, err
@@ -217,6 +226,22 @@ func DeleteImage(imageRef string) ([]string, error) {
 	}
 
 	return removed, nil
+}
+
+func referencedLayerDigests() (map[string]struct{}, error) {
+	images, err := ListImages()
+	if err != nil {
+		return nil, err
+	}
+
+	referenced := make(map[string]struct{})
+	for _, image := range images {
+		for _, layer := range image.Layers {
+			referenced[layer.Digest] = struct{}{}
+		}
+	}
+
+	return referenced, nil
 }
 
 func ParseImageReference(imageRef string) (string, string, error) {

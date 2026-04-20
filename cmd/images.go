@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"docksmith/store"
 )
@@ -28,9 +29,9 @@ func Images() {
 		return
 	}
 
-	fmt.Printf("%-24s %-10s %-14s %s\n", "NAME", "TAG", "ID", "CREATED")
+	fmt.Printf("%-24s %-10s %-14s %s\n", "NAME", "TAG", "IMAGE ID", "CREATED")
 	for _, img := range images {
-		id := img.Digest
+		id := strings.TrimPrefix(img.Digest, "sha256:")
 		if len(id) > 12 {
 			id = id[:12]
 		}

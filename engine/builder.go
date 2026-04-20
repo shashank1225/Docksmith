@@ -149,7 +149,7 @@ func Build(tag string, context string, opts BuildOptions) error {
 			imageConfig.Env = store.EnvMapToList(envMap)
 			cacheKey := cache.HashParts(prevDigest, inst.Raw, serializeEnv(envMap), imageConfig.WorkingDir, serializeCmd(imageConfig.Cmd))
 			hit := false
-			if !opts.NoCache {
+			if !opts.NoCache && !cascadeMiss {
 				if cachedDigest, ok := cacheIndex[cacheKey]; ok && cachedDigest == cacheKey {
 					hit = true
 				}
@@ -169,7 +169,7 @@ func Build(tag string, context string, opts BuildOptions) error {
 			pendingWorkdirCreate = true
 			cacheKey := cache.HashParts(prevDigest, inst.Raw, serializeEnv(envMap), imageConfig.WorkingDir, serializeCmd(imageConfig.Cmd))
 			hit := false
-			if !opts.NoCache {
+			if !opts.NoCache && !cascadeMiss {
 				if cachedDigest, ok := cacheIndex[cacheKey]; ok && cachedDigest == cacheKey {
 					hit = true
 				}
@@ -192,7 +192,7 @@ func Build(tag string, context string, opts BuildOptions) error {
 			imageConfig.Cmd = cmd
 			cacheKey := cache.HashParts(prevDigest, inst.Raw, serializeEnv(envMap), imageConfig.WorkingDir, serializeCmd(imageConfig.Cmd))
 			hit := false
-			if !opts.NoCache {
+			if !opts.NoCache && !cascadeMiss {
 				if cachedDigest, ok := cacheIndex[cacheKey]; ok && cachedDigest == cacheKey {
 					hit = true
 				}
